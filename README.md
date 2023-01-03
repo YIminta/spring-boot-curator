@@ -1,37 +1,82 @@
-# SpringBoot-Curator
+# 基于curator封装zookeeper常用api
 
-#### 介绍
-SpringBoot整合封装Curator，实现zookeeper分布式锁
+## 介绍
+Apache Curator是Apache ZooKeeper的高级Java客户端。它提供了许多有用的分布式系统解决方案，包括Elections、Locks、Barriers、Counters、Catches、Nodes/Watches、Queues。
+所有依赖Zookeeper的Apache项目，都使用Apache Curator，如：Hadoop、Flink、HBase等等。
 
-#### 软件架构
-软件架构说明
+版本说明 springboot 2.6.6 
+        curator 5.1.0
 
+### 说明
+```text
+实现Zookeeper分布式锁，主要是基于Zookeeper的 临时序列节点来实现的。
+1. 临时节点，指的是节点创建后，如果创建节点的客户端和 Zookeeper 服务端的会话失效(例如断开连接)，那么节点就会被删除。
+2. 持久节点指的是节点创建后，即使创建节点的客户端和 Zookeeper 服务端的会话失效(例如断开连接)，节点也不会被删除，只有客户端主动发起删除节点的请求，节点才会被删除。
+3. 序列节点，这种节点在创建时会有一个序号，这个序号是自增的。序列节点既可以是临时序列节点，也可以是持久序列节点。
 
-#### 安装教程
+临时序列实现分布式锁原理：
+当客户端来加锁的时候，会先在加锁的节点下建立一个子节点，这个节点就有一个序号，类似 lock-000001 ，
+创建成功之后会返回给客户端所创建的节点，然后客户端会去获取这个加锁节点下的所有客户端创建的子节点，当然也包括自己创建的子节点。
+拿到所有节点之后，给这些节点进行排序，然后判断自己创建的节点在这些节点中是否排在第一位，
+如果是的话，那么就代表当前客户端就算加锁成功了，如果不是的话，那么就代表当前客户端加锁失败。
+加锁失败的节点并不会不停地循环去尝试加锁，而是在自己创建节点的前一个节点上加一个监听器，然后就进行等待。
+当前面一个节点释放了锁，就会反过来通知等待的客户端，然后客户端就加锁成功了。
 
-1.  xxxx
-2.  xxxx
-3.  xxxx
+从这里可以看出redis和zk防止死锁的实现是不同的，redis是通过过期时间来防止死锁，而zk是通过临时节点来防止死锁的。
 
-#### 使用说明
+为什么使用顺序节点？其实为了防止羊群效应。
+如果没有使用顺序节点，假设很多客户端都会去加锁，那么加锁就会都失败，都会对加锁的节点加个监听器，
+那么一旦锁释放，那么所有的加锁客户端都会被唤醒来加锁，那么一瞬间就会造成很多加锁的请求，增加服务端的压力。
 
-1.  xxxx
-2.  xxxx
-3.  xxxx
+zk实现的分布式锁是公平的吗？
+其实使用临时顺序节点实现的分布式锁就是公平锁。所谓的公平锁就是加锁的顺序跟成功加锁的顺序是一样的。
+因为节点的顺序就是被唤醒的顺序，所以也就是加锁的顺序，所以天生就是公平锁。
+```
 
-#### 参与贡献
+### 相关配置说明
+yml配置
 
-1.  Fork 本仓库
-2.  新建 Feat_xxx 分支
-3.  提交代码
-4.  新建 Pull Request
+```yaml
+# curator配置
+curator-client:
+  # 连接字符串
+  connection-string: docker:2181
+  # 根节点
+  namespace: xzixi
+  # 节点数据编码
+  charset: utf8
+  # session超时时间
+  session-timeout-ms: 60000
+  # 连接超时时间
+  connection-timeout-ms: 15000
+  # 关闭连接超时时间
+  max-close-wait-ms: 1000
+  # 默认数据
+  default-data: ""
+  # 当半数以上zookeeper服务出现故障仍然提供读服务
+  can-be-read-only: false
+  # 自动创建父节点
+  use-container-parents-if-available: true
+  # 重试策略，默认使用BoundedExponentialBackoffRetry
+  retry:
+    max-sleep-time-ms: 10000
+    base-sleep-time-ms: 1000
+    max-retries: 3
+  # 认证信息 zookeeper账户密码 没有保持为空
+  auth:
+    scheme:
+    auth: 
+```
+### 其他相关
 
+#### ZK分布式锁和Redis分布式锁到底该选谁？
+```text
+redis分布式锁：
+优点：性能高，能保证AP，保证其高可用，
+缺点：正如Redisson的那篇文章所言，主要是如果出现主节点宕机，从节点还未来得及同步主节点的加锁信息，可能会导致重复加锁。虽然Redis官网提供了RedLock算法来解决这个问题，Redisson也实现了，但是RedLock算法其实本身是有一定的争议的，有大佬质疑该算法的可靠性；同时因为需要的机器过多，也会浪费资源，所以RedLock也不推荐使用。
+zk分布式锁：
+优点：zk本身其实就是CP的，能够保证加锁数据的一致性。每个节点的创建都会同时写入leader和follwer节点，半数以上写入成功才返回，如果leader节点挂了之后选举的流程会优先选举zxid（事务Id）最大的节点，就是选数据最全的，又因为半数写入的机制这样就不会导致丢数据
+缺点：性能没有redis高
+所以通过上面的对比可以看出，redis分布式锁和zk分布式锁的侧重点是不同的，这是redis和zk本身的定位决定的，redis分布式锁侧重高性能，zk分布式锁侧重高可靠性。所以一般项目中redis分布式锁和zk分布式锁的选择，是基于业务来决定的。如果你的业务需要保证加锁的可靠性，不能出错，那么zk分布式锁就比较符合你的要求；如果你的业务对于加锁的可靠性没有那么高的要求，那么redis分布式锁是个不错的选择。
 
-#### 特技
-
-1.  使用 Readme\_XXX.md 来支持不同的语言，例如 Readme\_en.md, Readme\_zh.md
-2.  Gitee 官方博客 [blog.gitee.com](https://blog.gitee.com)
-3.  你可以 [https://gitee.com/explore](https://gitee.com/explore) 这个地址来了解 Gitee 上的优秀开源项目
-4.  [GVP](https://gitee.com/gvp) 全称是 Gitee 最有价值开源项目，是综合评定出的优秀开源项目
-5.  Gitee 官方提供的使用手册 [https://gitee.com/help](https://gitee.com/help)
-6.  Gitee 封面人物是一档用来展示 Gitee 会员风采的栏目 [https://gitee.com/gitee-stars/](https://gitee.com/gitee-stars/)
+```
